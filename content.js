@@ -2,22 +2,33 @@
 // changes its markup, only that site's rule below needs updating.
 
 const LABELS = new Set([
-  "ad", "ads", "promoted", "sponsored", "promoted tweet",
+  "ad", "promoted", "sponsored", "promoted tweet",
   "gesponsert", "promocionado", "patrocinado", "sponsorisé", "anúncio", "annonce"
 ]);
 const LABEL_FROM = /^(ad|promoted|sponsored|gesponsert|promocionado|patrocinado|sponsorisé|anúncio|annonce) (from|by|de|von|por) \S+/i;
 
 const host = location.hostname.replace(/^www\./, "");
 
-// True if any element inside root has visible text that is an ad label
-// ("Ad", "Promoted", "Ad from example.com", ...). Checks every leaf element,
-// so it does not depend on tag names or attributes.
-function hasLabel(root) {
+// True if any leaf element inside root carries an ad label. Leaves inside an
+// ignored subtree (comments, tweet text...) are skipped, but only subtrees that
+// are inside root count; otherwise a post sitting in a <ul> would be ignored.
+// "Ad from site.com" style labels only count when they are inside a link, which
+// is how X renders them, so a normal tweet that happens to start with
+// "Sponsored by ..." is left alone.
+function hasLabel(root, ignoreSelector) {
+  if (!root) return false;
   for (const el of root.querySelectorAll("*")) {
     if (el.children.length !== 0) continue;
+    if (ignoreSelector) {
+      const skip = el.closest(ignoreSelector);
+      if (skip && root.contains(skip)) continue;
+    }
     const t = el.textContent.trim();
-    if (t.length > 0 && t.length < 60 && (LABELS.has(t.toLowerCase()) || LABEL_FROM.test(t))) {
-      return true;
+    if (t.length === 0 || t.length >= 60) continue;
+    if (LABELS.has(t.toLowerCase())) return true;
+    if (LABEL_FROM.test(t)) {
+      const link = el.closest("a");
+      if (link && root.contains(link)) return true;
     }
   }
   return false;
@@ -30,15 +41,41 @@ function hide(el) {
   }
 }
 
+// Re-checks posts a few times so lazy-loaded "Sponsored"/"Ad" badges are not missed,
+// scheduling a single shared follow-up pass even if no new DOM nodes are added.
+let retryTimer = null;
+function queueRetry(delay) {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    schedule();
+  }, delay);
+}
+
+function shouldCheck(el, maxAttempts = 5, intervalMs = 700) {
+  const now = Date.now();
+  const n = +(el.dataset.adN || 0);
+  const t = +(el.dataset.adT || 0);
+  if (n >= maxAttempts) return false;
+  if (now - t < intervalMs) {
+    queueRetry(intervalMs - (now - t) + 20);
+    return false;
+  }
+  el.dataset.adN = n + 1;
+  el.dataset.adT = now;
+  if (n + 1 < maxAttempts) {
+    queueRetry(intervalMs + 20);
+  }
+  return true;
+}
+
 // ---- X (Twitter) -----------------------------------------------------------
-// X's timeline is a virtualized list: <li data-index> items positioned
-// absolutely at offsets X computes from each item's measured height.
-//
-// We must NOT shift items around ourselves, or X's idea of the layout drifts
-// from what is on screen and it stops rendering/loading posts further down.
-// Instead we collapse each ad to a 1px-tall invisible sliver. X then measures
-// the smaller height and lays out the rest of the feed itself, so the tweets
-// connect naturally and infinite scroll keeps working.
+// X's timeline is a virtualized list (li[data-index] or div[data-testid="cellInnerDiv"])
+// positioned via computed offsets. Collapsing ad rows to 1px preserves X's scroll
+// math and allows recycled containers to be restored when reused for normal posts.
+const X_ROW_SEL = 'li[data-index], div[data-testid="cellInnerDiv"]';
+const X_IGNORE_SEL = '[data-testid="tweetText"], [data-testid="card.wrapper"], [role="blockquote"]';
+
 const COLLAPSE = {
   height: "1px", "min-height": "0", "max-height": "1px",
   overflow: "hidden", visibility: "hidden"
@@ -54,70 +91,82 @@ function clearProps(el, props) {
   for (const k in props) el.style.removeProperty(k);
 }
 
-function collapse(li) {
-  li.dataset.adHidden = "1";
-  setProps(li, COLLAPSE);
-  for (const c of li.children) setProps(c, COLLAPSE_CHILD);
+function collapse(row) {
+  row.dataset.adHidden = "1";
+  setProps(row, COLLAPSE);
+  for (const c of row.children) setProps(c, COLLAPSE_CHILD);
 }
-function restore(li) {
-  delete li.dataset.adHidden;
-  clearProps(li, COLLAPSE);
-  for (const c of li.children) clearProps(c, COLLAPSE_CHILD);
+function restore(row) {
+  delete row.dataset.adHidden;
+  clearProps(row, COLLAPSE);
+  for (const c of row.children) clearProps(c, COLLAPSE_CHILD);
 }
 
 function xIsAd(article) {
-  return hasLabel(article) || !!article.querySelector('[data-testid="placementTracking"]');
+  return !!article.querySelector('[data-testid="placementTracking"]') || hasLabel(article, X_IGNORE_SEL);
 }
 
 function xRule() {
-  const now = Date.now();
   let changed = false;
 
-  // 1) Restore items that X recycled for a normal post.
-  document.querySelectorAll("li[data-index][data-ad-hidden]").forEach(li => {
-    const a = li.querySelector("article");
-    if (a && !xIsAd(a)) { restore(li); changed = true; }
+  // 1) Restore virtualized rows (both li[data-index] and cellInnerDiv) recycled for normal posts.
+  document.querySelectorAll('li[data-index][data-ad-hidden], div[data-testid="cellInnerDiv"][data-ad-hidden]').forEach(row => {
+    const a = row.querySelector("article");
+    if (!a || !xIsAd(a)) {
+      restore(row);
+      if (a) {
+        delete a.dataset.adN;
+        delete a.dataset.adT;
+      }
+      changed = true;
+    }
   });
 
-  // 2) Find and collapse new ads.
-  document.querySelectorAll("article:not([data-ad-hidden])").forEach(a => {
-    const li = a.closest("li[data-index]");
-    const holder = li || a.closest("[data-testid='cellInnerDiv']") || a;
+  // 2) Detect and collapse new ads.
+  document.querySelectorAll("article").forEach(a => {
+    const row = a.closest(X_ROW_SEL);
+    const holder = row || a;
     if (holder.dataset.adHidden) return;
 
-    // Labels can load a moment after the post; re-check a few times, then stop.
-    const n = +(a.dataset.adN || 0);
-    const t = +(a.dataset.adT || 0);
-    if (n >= 4 || now - t < 800) return;
-    a.dataset.adN = n + 1;
-    a.dataset.adT = now;
+    // Reset retry counters if X swaps a new tweet into an existing <article> node.
+    const statusHref = a.querySelector('a[href*="/status/"]')?.getAttribute("href") || "";
+    if (a.dataset.adHref !== statusHref) {
+      a.dataset.adHref = statusHref;
+      delete a.dataset.adN;
+      delete a.dataset.adT;
+    }
 
+    if (!shouldCheck(a)) return;
     if (!xIsAd(a)) return;
 
-    if (li) collapse(li); else hide(holder);
+    if (row) collapse(row);
+    else hide(holder);
     changed = true;
   });
 
-  // Nudge X to re-measure its list right away (harmless if it already does).
+  // Nudge X to re-measure its virtualized list right away.
   if (changed) window.dispatchEvent(new Event("resize"));
 }
 
 const rules = {
   "x.com": () => xRule(),
+  "twitter.com": () => xRule(),
 
   "reddit.com": () => {
     document.querySelectorAll("shreddit-ad-post, shreddit-comments-page-ad, [data-testid='ad-post']")
       .forEach(hide);
-    document.querySelectorAll("shreddit-post:not([data-ad-checked])").forEach(p => {
-      p.dataset.adChecked = "1";
-      if (p.hasAttribute("promoted") || hasLabel(p)) hide(p);
+    document.querySelectorAll("shreddit-post:not([data-ad-hidden])").forEach(p => {
+      if (!shouldCheck(p)) return;
+      if (p.hasAttribute("promoted") || hasLabel(p, '[slot="text-body"], [slot="comment"], shreddit-comment')) {
+        hide(p);
+      }
     });
   },
 
   "instagram.com": () => {
-    document.querySelectorAll("article:not([data-ad-checked])").forEach(a => {
-      a.dataset.adChecked = "1";
-      if (hasLabel(a)) hide(a);
+    document.querySelectorAll("article:not([data-ad-hidden])").forEach(a => {
+      if (!shouldCheck(a)) return;
+      if (hasLabel(a, "ul, form")) hide(a);
     });
   },
 
@@ -125,14 +174,18 @@ const rules = {
     document.querySelectorAll(
       "ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-banner-promo-renderer, " +
       "ytd-promoted-sparkles-web-renderer, #masthead-ad, ytd-display-ad-renderer"
-    ).forEach(el => hide(el.closest("ytd-rich-item-renderer") || el));
+    ).forEach(el => hide(el.closest("ytd-rich-item-renderer, ytd-video-renderer, ytd-compact-video-renderer") || el));
   },
 
-  // Best effort: Facebook obfuscates its "Sponsored" label, so this may miss some.
   "facebook.com": () => {
-    document.querySelectorAll('div[role="article"]:not([data-ad-checked])').forEach(a => {
-      a.dataset.adChecked = "1";
-      if (hasLabel(a) || a.querySelector('a[href*="/ads/about"]')) hide(a);
+    document.querySelectorAll('div[role="article"]:not([data-ad-hidden])').forEach(a => {
+      if (!shouldCheck(a)) return;
+      if (
+        a.querySelector('a[href*="/ads/about"]') ||
+        hasLabel(a, '[data-ad-preview="message"], [aria-label*="Comment" i], ul')
+      ) {
+        hide(a);
+      }
     });
   }
 };
